@@ -11,19 +11,49 @@ const app = express();
 app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }));
 app.use(express.json());
 
-// Load Firebase Admin SDK
+// ─── Load Firebase Admin SDK credentials ─────────────────────────────────────
 let firebaseCredentials;
-if (process.env.FIREBASE_CREDENTIALS) {
-  firebaseCredentials = JSON.parse(process.env.FIREBASE_CREDENTIALS);
+
+if (process.env.GCP_SERVICE_ACCOUNT_JSON_B64) {
+  // Decode Base64 JSON
+  try {
+    const rawJson = Buffer.from(
+      process.env.GCP_SERVICE_ACCOUNT_JSON_B64,
+      "base64"
+    ).toString("utf8");
+    firebaseCredentials = JSON.parse(rawJson);
+    console.log(
+      "✅ Loaded Firebase credentials from GCP_SERVICE_ACCOUNT_JSON_B64"
+    );
+  } catch (e) {
+    console.error(
+      "❌ Failed to decode or parse GCP_SERVICE_ACCOUNT_JSON_B64:",
+      e
+    );
+    process.exit(1);
+  }
+} else if (process.env.GCP_SERVICE_ACCOUNT_JSON) {
+  // Parse raw JSON string
+  try {
+    firebaseCredentials = JSON.parse(process.env.GCP_SERVICE_ACCOUNT_JSON);
+    console.log("✅ Loaded Firebase credentials from GCP_SERVICE_ACCOUNT_JSON");
+  } catch (e) {
+    console.error("❌ Failed to parse GCP_SERVICE_ACCOUNT_JSON:", e);
+    process.exit(1);
+  }
 } else {
+  // Fallback to local file
   try {
     firebaseCredentials = require("./serviceAccountKey.json");
   } catch (error) {
-    console.error("Firebase credentials not found.");
+    console.error(
+      "❌ Firebase credentials not found. Set GCP_SERVICE_ACCOUNT_JSON(_B64) or include serviceAccountKey.json"
+    );
     process.exit(1);
   }
 }
 
+// Initialize Firebase Admin
 admin.initializeApp({
   credential: admin.credential.cert(firebaseCredentials),
   storageBucket:
@@ -197,13 +227,10 @@ app.put(
       if (phone) {
         console.log(`Updating phone number for user ${supplierId}: ${phone}`);
 
-        // Validate phone number format
-        const isValidPhoneNumber = /^\+?[1-9]\d{1,14}$/.test(phone);
-        if (!isValidPhoneNumber) {
+        if (!isValidPhoneNumber(phone)) {
           return res.status(400).json({ error: "Invalid phone number format" });
         }
 
-        // Check for duplicate phone number
         try {
           const userWithPhone = await admin.auth().getUserByPhoneNumber(phone);
           if (userWithPhone.uid !== supplierId) {
@@ -220,7 +247,6 @@ app.put(
           }
         }
 
-        // Update phone number in Firebase Auth
         try {
           await admin.auth().updateUser(supplierId, { phoneNumber: phone });
           console.log(
@@ -294,11 +320,11 @@ app.put(
   }
 );
 
+// Delete Supplier
 app.delete("/api/delete-supplier/:id", async (req, res) => {
   try {
     const supplierId = req.params.id;
 
-    // Fetch supplier document from Firestore
     const supplierRef = db.collection("users").doc(supplierId);
     const supplierDoc = await supplierRef.get();
 
@@ -306,7 +332,6 @@ app.delete("/api/delete-supplier/:id", async (req, res) => {
       return res.status(404).json({ error: "Supplier not found" });
     }
 
-    // Delete supplier's authentication record
     try {
       await admin.auth().deleteUser(supplierId);
       console.log(`Successfully deleted auth user with ID ${supplierId}`);
@@ -318,7 +343,6 @@ app.delete("/api/delete-supplier/:id", async (req, res) => {
       });
     }
 
-    // Delete supplier document from Firestore
     await supplierRef.delete();
     console.log(
       `Successfully deleted Firestore supplier with ID ${supplierId}`
@@ -352,13 +376,13 @@ app.put("/api/approve-supplier/:id", async (req, res) => {
     res.status(200).json({ message: "Supplier approved successfully." });
   } catch (error) {
     console.error("Error approving supplier:", error);
-    res.status(500).json({
-      error: "Failed to approve supplier",
-      details: error.message,
-    });
+    res
+      .status(500)
+      .json({ error: "Failed to approve supplier", details: error.message });
   }
 });
 
+// Authenticate Supplier
 app.post("/api/authenticate-supplier/:id", async (req, res) => {
   try {
     const supplierId = req.params.id;
@@ -379,39 +403,30 @@ app.post("/api/authenticate-supplier/:id", async (req, res) => {
     }
 
     try {
-      // Try to get user by phone
       await admin.auth().getUserByPhoneNumber(phone);
       return res.status(200).json({ message: "User already authenticated" });
     } catch (error) {
       if (error.code !== "auth/user-not-found") throw error;
 
-      // Create Firebase Auth user
       const userRecord = await admin.auth().createUser({
         phoneNumber: phone,
         displayName: name || "",
         email: email || undefined,
       });
 
-      // Update Firestore user doc with UID
-      await supplierRef.update({
+      await supplierRef.update({ uid: userRecord.uid });
+
+      return res.status(201).json({
+        message: "User authenticated successfully",
         uid: userRecord.uid,
       });
-
-      return res
-        .status(201)
-        .json({
-          message: "User authenticated successfully",
-          uid: userRecord.uid,
-        });
     }
   } catch (error) {
     console.error("Error authenticating supplier:", error);
-    res
-      .status(500)
-      .json({
-        error: "Failed to authenticate supplier",
-        details: error.message,
-      });
+    res.status(500).json({
+      error: "Failed to authenticate supplier",
+      details: error.message,
+    });
   }
 });
 
